@@ -1,0 +1,33 @@
+name: StudyWell Backend Services
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydatabase
+    ports:
+    - "5432:5432"
+  express-api:
+    build:
+      context: .
+    container_name: express_api
+    restart: always
+    ports:
+      - "3000:3000" # expose port 3000 for the Express app
+      - "5555:5555" # expose port 5555 for the Prisma studio
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: "postgresql://myuser:mypassword@postgres:5432/mydatabase?schema=public"
+    volumes:
+      - .:/app #Mount project directory ( local express-api ) inside the container
+      - node_modules:/app/node_modules  # Named volume instead of an anonymous one
+    command: |  
+      sh -c "npm install && npx prisma migrate deploy && npx prisma generate && npm run dev"
+
+volumes:
+  node_modules:
