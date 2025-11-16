@@ -1,0 +1,410 @@
+// ----- GENERATOR & DATASOURCE -----
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// =======================
+// Enums
+// =======================
+enum EventSource {
+  USER
+  ACADEMIC
+  TIMETABLE
+}
+
+enum ClassType {
+  LEC
+  TUT
+  LAB
+  SEM
+  OTHER
+}
+
+enum AcademicType {
+  TEACHING_WEEK
+  RECESS_WEEK
+  EXAM_WEEK
+  PUBLIC_HOLIDAY
+  STUDY_WEEK
+}
+
+enum UploadStatus {
+  pending
+  processing
+  completed
+  failed
+}
+
+// NEW: delivery mode to capture ONLINE/PHYSICAL/HYBRID patterns
+enum DeliveryMode {
+  PHYSICAL
+  ONLINE
+  HYBRID
+}
+
+// =======================
+// Core auth & profiles
+// =======================
+model Student {
+  id              String    @id @default(cuid())
+  name            String
+  email           String    @unique
+  passwordHash    String
+  emailVerifiedAt DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  // relations (stateless JWT → no sessions/verify/reset tables)
+  events                Event[]
+  preferences           Preferences?
+  enrollments           TimetableEnrollment[]
+  academicCalendarFiles AcademicCalendarFile[] @relation("StudentAcademicFiles")
+  semesterCalendarFiles SemesterCalendarFile[] @relation("StudentSemesterFiles")
+  mainCalendars         MainCalendar[]
+  uploads               Upload[]
+
+  @@index([email])
+}
+
+// =======================
+// Preferences
+// =======================
+model Preferences {
+  studentId        String   @id
+  outdoorAllowed   Boolean  @default(true)
+  nudgeWindowStart Int      @default(9)  // 0..23
+  nudgeWindowEnd   Int      @default(21) // 0..23
+  quietHoursStart  Int      @default(23) // 0..23
+  quietHoursEnd    Int      @default(7)  // 0..23
+  timezone         String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+}
+
+// =======================
+// Calendar: Semester + Main Calendar
+// =======================
+model Semester {
+  id                String   @id @default(cuid())
+
+  // Canonical display, e.g. "AY25/26 Sem 1"
+  name              String   @unique
+
+  // Short + long forms
+  academicYearShort String   // e.g., "25/26"
+  academicYear      String   // e.g., "AY25/26"
+
+  // 1 or 2 (from OCR)
+  semesterNo        Int
+
+  // Duration (Mon of Teaching Wk 1 to end)
+  startsOn          DateTime
+  endsOn            DateTime
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  academicEvents        AcademicCalEvent[]
+  classes               CourseClass[]
+  events                Event[]
+  courseExams           CourseExam[]
+  academicCalendarFiles AcademicCalendarFile[]
+  semesterCalendarFiles SemesterCalendarFile[]
+  mainCalendars         MainCalendar[]
+
+  @@index([startsOn])
+  @@index([endsOn])
+  @@index([semesterNo])
+  @@index([academicYearShort])
+}
+
+model AcademicCalEvent {
+  id         String       @id @default(cuid())
+  semesterId String
+  kind       AcademicType
+  title      String       @db.LongText
+  notes      String?      @db.Text
+  weekNo     Int?
+
+  // NEW: event range
+  startsOn   DateTime
+  endsOn     DateTime
+
+  // keep these convenience props (anchored to startsOn Monday for weeks)
+  month      Int?
+  weekday    Int?
+
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  semester Semester @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+
+  // uniqueness by range start
+  @@unique([semesterId, startsOn, kind])
+
+  // indexes
+  @@index([semesterId, startsOn])
+  @@index([semesterId, weekNo])
+  @@index([month])
+  @@index([weekday])
+}
+
+// =======================
+// Main Calendar (aggregated feed for Google sync)
+// =======================
+model MainCalendar {
+   id            String   @id @default(cuid())
+   semesterId    String?                  // semester id is optional
+   studentId     String
+   title         String
+   startsAt      DateTime
+   endsAt        DateTime
+   location      String?
+   description   String?
+   source        EventSource
+   externalId    String?
+   isSynced      Boolean  @default(false)
+   googleEventId String?
+   createdAt     DateTime @default(now())
+   updatedAt     DateTime @updatedAt
+
+   semester Semester? @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+
+   student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+   @@index([studentId])
+   @@index([semesterId])
+   @@index([startsAt])
+   @@index([source])
+   @@index([externalId])
+
+   @@unique([studentId, source, externalId, startsAt])
+}
+
+
+// =======================
+// Courses & Timetable
+// =======================
+model Course {
+  id        String   @id @default(cuid())
+  code      String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  classes     CourseClass[]
+  enrollments TimetableEnrollment[]
+  courseExams CourseExam[]
+
+  @@unique([code, name]) // used by upsert (where: { code_name: { ... } })
+  @@index([code])
+}
+
+model CourseClass {
+  id         String    @id @default(cuid())
+  courseId   String
+  semesterId String
+  index      String
+  component  ClassType
+
+  // pattern fields (materialize to Event)
+  dayOfWeek  Int
+  startTime  String       // "13:30" (local)
+  endTime    String       // "15:30"
+  weeksJson  String
+  location   String?
+
+  delivery   DeliveryMode? @default(PHYSICAL)
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  course      Course      @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  semester    Semester    @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+  enrollments TimetableEnrollment[]
+
+  @@unique([semesterId, index, component, dayOfWeek, startTime, endTime])
+  @@index([courseId, semesterId])
+  @@index([semesterId, dayOfWeek])
+  @@index([delivery])
+}
+
+model TimetableEnrollment {
+  id        String   @id @default(cuid())
+  studentId String
+  courseId  String
+  classId   String
+  createdAt DateTime @default(now())
+
+  student Student     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  course  Course      @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  class   CourseClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@unique([studentId, classId])
+  @@index([studentId])
+  @@index([courseId])
+}
+
+model CourseExam {
+  id         String   @id @default(cuid())
+  courseId   String
+  semesterId String
+  startsAt   DateTime
+  endsAt     DateTime
+  location   String?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  course   Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  semester Semester @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+
+  @@index([courseId, semesterId])
+  @@index([startsAt])
+  @@index([endsAt])
+
+  @@unique([courseId, semesterId, startsAt])
+}
+
+// =======================
+// Unified Event table (system-internal/raw)
+// =======================
+model Event {
+  id         String   @id @default(cuid())
+  studentId  String
+  title      String
+  startsAt   DateTime
+  endsAt     DateTime
+  location   String?
+  category   String?
+  notes      String?
+  recurrence String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // unified-source fields
+  source        EventSource @default(USER)
+  isLocked      Boolean     @default(false)
+  externalId    String?
+  semesterId    String?
+  courseCode    String?
+  classType     ClassType?
+  classIndex    String?
+
+  student  Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  semester Semester? @relation(fields: [semesterId], references: [id], onDelete: SetNull)
+
+  @@unique([studentId, source, externalId, startsAt])
+  @@index([studentId, startsAt])
+  @@index([studentId, endsAt])
+  @@index([source])
+  @@index([semesterId])
+  @@index([externalId])
+}
+
+// =======================
+// Calendar files (bytes + extraction)
+// =======================
+model AcademicCalendarFile {
+  id            String   @id @default(cuid())
+  semesterId    String
+  studentId     String
+  filePath      String
+  fileName      String
+  mimeType      String
+  sizeBytes     Int
+  content       Bytes
+  textContent   String?    @db.LongText
+  extractedJson Json?
+  uploadedAt    DateTime   @default(now())
+
+  semester Semester @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+  student  Student  @relation("StudentAcademicFiles", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([semesterId])
+  @@index([studentId])
+  @@index([uploadedAt])
+}
+
+model SemesterCalendarFile {
+  id         String   @id @default(cuid())
+  semesterId String
+  studentId  String
+  filePath   String
+  fileName   String
+  mimeType   String
+  sizeBytes  Int
+  uploadedAt DateTime @default(now())
+
+  // Keep symmetry with AcademicCalendarFile
+  content       Bytes
+  textContent   String?   @db.LongText
+  extractedJson Json?
+
+  semester Semester @relation(fields: [semesterId], references: [id], onDelete: Cascade)
+  student  Student  @relation("StudentSemesterFiles", fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([semesterId])
+  @@index([studentId])
+  @@index([uploadedAt])
+}
+
+// =======================
+// Uploads (temp tracking)
+// =======================
+model Upload {
+  id               String        @id     // generated uploadId elsewhere
+  studentId        String
+  originalFilename String
+  mimeType         String
+  fileSize         Int
+  tempPath         String
+  uploadedAt       DateTime
+  expiresAt        DateTime
+  status           UploadStatus  @default(pending)
+
+  student Student @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@index([studentId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// =======================
+// Nudges & Actions
+// =======================
+model Nudge {
+  id          String    @id @default(cuid())
+  studentId   String
+  type        String
+  rationale   String[]  // e.g. ["Good weather", "Free slot available"]
+  status      String    @default("pending") // "pending" | "sent" | "dismissed" | "accepted"
+  createdAt   DateTime  @default(now())
+
+  student     Student   @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  actions     Action[]
+
+  @@index([studentId])
+  @@index([status])
+}
+
+model Action {
+  id         String   @id @default(cuid())
+  nudgeId    String
+  userId     String
+  type       String   // "accept" | "dismiss" | "ignore"
+  createdAt  DateTime @default(now())
+
+  nudge      Nudge    @relation(fields: [nudgeId], references: [id], onDelete: Cascade)
+
+  @@index([nudgeId])
+  @@index([userId])
+}
